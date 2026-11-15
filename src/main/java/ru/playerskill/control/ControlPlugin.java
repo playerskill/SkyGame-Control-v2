@@ -3,6 +3,7 @@ package ru.playerskill.control;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
 import ru.playerskill.control.modules.EatFixModule;
+import ru.playerskill.control.modules.EasyBansModule;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +24,7 @@ public class ControlPlugin extends JavaPlugin {
         PluginCommand control = getCommand("control");
         if (control != null) {
             control.setExecutor(commandHandler);
+            control.setTabCompleter(commandHandler);
         }
     }
 
@@ -40,12 +42,15 @@ public class ControlPlugin extends JavaPlugin {
     /** Поднимает модули согласно конфигу. Сначала гарантированно выключает старые. */
     private void enableModules() {
         disableModules();
+        // Подкоманды модулей живут в реестре CommandHandler — при перезагрузке
+        // реестр тоже чистим, чтобы старые экземпляры не остались висеть.
+        commandHandler.unregisterAll();
 
         // --- Регистрация модулей. Каждый — в своём try-catch,
         // чтобы сбой одного не уронил весь плагин. ---
         if (getConfig().getBoolean("eat-fix.enabled", true)) {
             try {
-                modules.add(new EatFixModule(this));
+                register(new EatFixModule(this));
             } catch (NoSuchFieldException ex) {
                 getLogger().warning("EatFix: поле activeItemStack не найдено — версия сервера несовместима. Модуль отключён.");
             } catch (Exception ex) {
@@ -53,8 +58,17 @@ public class ControlPlugin extends JavaPlugin {
             }
         }
 
+        // EasyBans: только админская команда, на игру не влияет —
+        // поэтому без выключателя, модуль активен всегда.
+        try {
+            register(new EasyBansModule(this));
+        } catch (Exception ex) {
+            getLogger().warning("EasyBans: не удалось загрузить модуль: " + ex.getMessage());
+        }
+
         // Новые модули добавляйте здесь по той же схеме:
-        // if (getConfig().getBoolean("имя-модуля.enabled", true)) { try { modules.add(new ...); } catch (...) {...} }
+        // try { register(new ...); } catch (...) {...}
+        // (для модулей, вмешивающихся в игру, — ещё и if с enabled-ключом)
 
         for (Module module : modules) {
             try {
@@ -76,6 +90,16 @@ public class ControlPlugin extends JavaPlugin {
             }
         }
         modules.clear();
+    }
+
+    /** Регистрирует модуль и его подкоманды. */
+    private void register(Module module) {
+        modules.add(module);
+        if (module instanceof SubcommandProvider) {
+            for (Subcommand sub : ((SubcommandProvider) module).getSubcommands()) {
+                commandHandler.register(sub);
+            }
+        }
     }
 
     public List<Module> getModules() {
