@@ -13,12 +13,18 @@
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
         <spigot.api.version>1.12.2-R0.1-SNAPSHOT</spigot.api.version>
+        <protocol.lib.version>4.4.0</protocol.lib.version>
     </properties>
 
     <repositories>
         <repository>
             <id>spigot-repo</id>
             <url>https://hub.spigotmc.org/nexus/content/repositories/snapshots/</url>
+        </repository>
+        <!-- ProtocolLib -->
+        <repository>
+            <id>dmulloy2-repo</id>
+            <url>https://repo.dmulloy2.net/repository/public/</url>
         </repository>
     </repositories>
 
@@ -27,6 +33,14 @@
             <groupId>org.spigotmc</groupId>
             <artifactId>spigot-api</artifactId>
             <version>${spigot.api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Только для компиляции: на сервере jar отдаёт сам ProtocolLib,
+             поэтому provided — ничего не попадёт внутрь нашего jar -->
+        <dependency>
+            <groupId>com.comphenix.protocol</groupId>
+            <artifactId>ProtocolLib</artifactId>
+            <version>${protocol.lib.version}</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
