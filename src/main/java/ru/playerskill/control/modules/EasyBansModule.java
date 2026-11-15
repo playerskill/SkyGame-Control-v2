@@ -161,17 +161,52 @@ public class EasyBansModule implements Module, SubcommandProvider {
         return template.replace("{table}", table).replace("{where}", where);
     }
 
-    /** Соединение из общего раздела database. */
+    /**
+     * Соединение из общего раздела database.
+     *
+     * URL собран с параметрами, закрывающими известные проблемы
+     * драйвера против MySQL 8 и хостинговых конфигураций:
+     * useSSL=false — гасит SSL-рукопожатие и предупреждение драйвера 5.1;
+     * allowPublicKeyRetrieval=true — нужен против caching_sha2_password;
+     * serverTimezone=UTC — MySQL 8 без таймзоны валит драйвер;
+     * connectTimeout/socketTimeout — соединение умирает с понятной
+     * ошибкой вместо вечного зависания.
+     */
     private Connection openConnection() throws Exception {
         String host = plugin.getConfig().getString("database.host", "localhost");
         int port = plugin.getConfig().getInt("database.port", 3306);
         String db = plugin.getConfig().getString("database.database", "bans");
         String user = plugin.getConfig().getString("database.user", "root");
         String password = plugin.getConfig().getString("database.password", "");
-        boolean utf8 = plugin.getConfig().getBoolean("database.use-utf8", true);
+
+        // Диагностика: видим в логе, куда реально подключаемся.
+        plugin.getLogger().info("[EasyBans] Подключаюсь к " + host + ":" + port + "/" + db + " как " + user);
+
         String url = "jdbc:mysql://" + host + ":" + port + "/" + db
-                + (utf8 ? "?useUnicode=true&characterEncoding=utf8" : "");
-        return DriverManager.getConnection(url, user, password);
+                + "?useUnicode=true&characterEncoding=utf8"
+                + "&useSSL=false"
+                + "&allowPublicKeyRetrieval=true"
+                + "&serverTimezone=UTC"
+                + "&autoReconnect=true"
+                + "&connectTimeout=10000"
+                + "&socketTimeout=30000";
+
+        try {
+            return DriverManager.getConnection(url, user, password);
+        } catch (Exception first) {
+            // Запасной вариант для старого драйвера 5.1: он не знает
+            // allowPublicKeyRetrieval и serverTimezone и падает на них.
+            String legacyUrl = "jdbc:mysql://" + host + ":" + port + "/" + db
+                    + "?useUnicode=true&characterEncoding=utf8"
+                    + "&useSSL=false"
+                    + "&autoReconnect=true";
+            try {
+                return DriverManager.getConnection(legacyUrl, user, password);
+            } catch (Exception second) {
+                // Наверх уходит первая (более информативная) ошибка.
+                throw first;
+            }
+        }
     }
 
     /** Готовое сообщение с префиксом и цветами, прямо в текущем потоке. */
