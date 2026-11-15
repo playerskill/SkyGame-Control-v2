@@ -18,7 +18,7 @@ eat-fix:
 # Поддерживаются цветовые коды через &.
 # ------------------------------------------
 messages:
-  prefix: "&8[&bControl&8] &r"
-  reloaded: "&aКонфигурация перезагружена. Активных модулей: &f{count}"
+  prefix: "&6[&bSkyGame&c-&aControl&6] &r"
+  reloaded: "&aКонфигурация перезагружена. Активных модулей: &6{count}"
   no-permission: "&cНедостаточно прав."
-  usage: "&cИспользование: /control reload"
+  usage: "&cИспользование: &f/control reload"
