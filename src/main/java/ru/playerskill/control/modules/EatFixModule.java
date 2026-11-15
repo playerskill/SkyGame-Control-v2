@@ -1,11 +1,6 @@
+
 package ru.playerskill.control.modules;
 
-import com.comphenix.protocol.PacketType;
-import com.comphenix.protocol.ProtocolLibrary;
-import com.comphenix.protocol.ProtocolManager;
-import com.comphenix.protocol.events.ListenerPriority;
-import com.comphenix.protocol.events.PacketAdapter;
-import com.comphenix.protocol.events.PacketEvent;
 import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -13,32 +8,19 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerAnimationEvent;
-import org.bukkit.inventory.ItemStack;
 import ru.playerskill.control.ControlPlugin;
 import ru.playerskill.control.Module;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Фикс MC-849 и связанного с ним поведения клиента. Два независимых механизма
- * с отдельными тумблерами в конфиге:
+ * Фикс MC-849: при ударе клиент сам отменяет использование еды или зелья,
+ * а сервер нет — через 1,6 секунды предмет расходуется без анимации.
+ * Ловим замах и сбрасываем активный предмет на сервере.
  *
- * 1. Боевая часть (block-on-attack): при ударе клиент сам отменяет использование
- *    еды или зелья, а сервер нет — через 1,6 секунды предмет расходуется без
- *    анимации. Ловим замах и сбрасываем активный предмет на сервере.
- *
- * 2. Пакетная часть (block-on-npc-click, требует ProtocolLib): при правом клике
- *    по сущности, которую «не приняла» игра (Citizens, Shopkeepers), клиент
- *    откатывается к использованию предмета — еда начинается заново уже после
- *    нашего сброса. Citizens перехватывает пакеты до событий Bukkit, поэтому
- *    клик ловим пакетом USE_ENTITY (раньше Citizens), а следующий пакет
- *    USE_ITEM в коротком окне отменяем. Пока правая кнопка удерживается на НПС,
- *    клиент шлёт USE_ENTITY повторно — окно обновляется, утечки нет.
+ * Клик по сущностям (НПС Citizens, Shopkeepers) не обрабатывается.
  *
  * Имена полей и методов NMS в Spigot обфусцированы, поэтому:
  *  - поле активного предмета ищем по типу (единственный нестатический,
@@ -47,18 +29,11 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class EatFixModule implements Module, Listener {
 
-    /** Окно по умолчанию: перекрывает спам пакетов при удержании кнопки (~200 мс). */
-    private static final long DEFAULT_WINDOW_MS = 400L;
-
     private final ControlPlugin plugin;
     private final Field activeItemStackField;
     private final Method asBukkitCopy;
     private final Method getHandleMethod;
-    private final boolean blockOnAttack;
-    private final boolean blockOnNpcClick;
-    private final long windowMs;
-    private final Map<UUID, Long> entityClickMarks = new ConcurrentHashMap<UUID, Long>();
-    private ProtocolManager protocolManager;
+    private final boolean debug;
     private boolean warned = false;
 
     public EatFixModule(ControlPlugin plugin) throws Exception {
@@ -73,31 +48,15 @@ public class EatFixModule implements Module, Listener {
         }
         activeItemStackField.setAccessible(true);
 
-        // CraftItemStack.asBukkitCopy(nms) — статический, имя метода не обфусцировано.
         Class<?> craftItemStack = Class.forName("org.bukkit.craftbukkit.v1_12_R1.inventory.CraftItemStack");
         asBukkitCopy = craftItemStack.getMethod("asBukkitCopy", nmsItemStack);
 
-        // CraftPlayer.getHandle() — кешируем один раз, метод не обфусцирован.
         Class<?> craftPlayer = Class.forName("org.bukkit.craftbukkit.v1_12_R1.entity.CraftPlayer");
         getHandleMethod = craftPlayer.getMethod("getHandle");
 
-        blockOnAttack = plugin.getConfig().getBoolean("eat-fix.block-on-attack", true);
-        blockOnNpcClick = plugin.getConfig().getBoolean("eat-fix.block-on-npc-click", true);
-        windowMs = plugin.getConfig().getLong("eat-fix.entity-click-window-ms", DEFAULT_WINDOW_MS);
+        debug = plugin.getConfig().getBoolean("eat-fix.debug", false);
 
-        if (blockOnNpcClick) {
-            if (plugin.getServer().getPluginManager().getPlugin("ProtocolLib") == null) {
-                plugin.getLogger().warning("EatFix: block-on-npc-click=true, но ProtocolLib не найден. "
-                        + "Фикс НПС отключён, защита при ударе остаётся активной.");
-            } else {
-                protocolManager = ProtocolLibrary.getProtocolManager();
-            }
-        }
-
-        plugin.getLogger().info("EatFix v4: защита при ударе "
-                + (blockOnAttack ? "вкл" : "выкл")
-                + ", фикс НПС "
-                + (protocolManager != null ? "вкл (окно " + windowMs + " мс)" : "выкл"));
+        plugin.getLogger().info("EatFix активен.");
     }
 
     @Override
@@ -108,52 +67,11 @@ public class EatFixModule implements Module, Listener {
     @Override
     public void enable() {
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
-
-        if (protocolManager != null) {
-            // Клик по сущности на уровне пакетов — раньше Citizens.
-            protocolManager.addPacketListener(new PacketAdapter(plugin, ListenerPriority.LOW,
-                    PacketType.Play.Client.USE_ENTITY) {
-                @Override
-                public void onPacketReceiving(PacketEvent event) {
-                    Player player = event.getPlayer();
-                    if (player == null) {
-                        return;
-                    }
-                    entityClickMarks.put(player.getUniqueId(), System.currentTimeMillis());
-                    clearActiveItem(player);
-                }
-            });
-
-            // Использование предмета: гасим «откат» после клика по сущности.
-            protocolManager.addPacketListener(new PacketAdapter(plugin, ListenerPriority.LOW,
-                    PacketType.Play.Client.USE_ITEM) {
-                @Override
-                public void onPacketReceiving(PacketEvent event) {
-                    Player player = event.getPlayer();
-                    if (player == null) {
-                        return;
-                    }
-                    Long mark = entityClickMarks.get(player.getUniqueId());
-                    if (mark == null || System.currentTimeMillis() - mark > windowMs) {
-                        return;
-                    }
-                    if (!holdsConsumable(player)) {
-                        return;
-                    }
-                    event.setCancelled(true);
-                    clearActiveItem(player);
-                }
-            });
-        }
     }
 
     @Override
     public void disable() {
         HandlerList.unregisterAll(this);
-        if (protocolManager != null) {
-            protocolManager.removePacketListeners(plugin);
-        }
-        entityClickMarks.clear();
     }
 
     /**
@@ -188,16 +106,10 @@ public class EatFixModule implements Module, Listener {
      */
     @EventHandler(priority = EventPriority.MONITOR)
     public void onSwing(PlayerAnimationEvent event) {
-        if (!blockOnAttack) {
-            return;
-        }
+        debug(event.getPlayer(), "замах: сбрасываю активный предмет");
         clearActiveItem(event.getPlayer());
     }
 
-    /**
-     * Читаем и пишем NMS-поле напрямую: это работа с памятью, без вызовов
-     * Bukkit API, поэтому допустимо на потоке ProtocolLib (Netty).
-     */
     private void clearActiveItem(Player player) {
         try {
             Object handle = getHandleMethod.invoke(player);
@@ -206,9 +118,10 @@ public class EatFixModule implements Module, Listener {
                 return;
             }
 
-            Material material = ((ItemStack) asBukkitCopy.invoke(null, active)).getType();
+            Material material = ((org.bukkit.inventory.ItemStack) asBukkitCopy.invoke(null, active)).getType();
             if (isConsumable(material)) {
                 activeItemStackField.set(handle, null);
+                debug(player, "активный предмет сброшен: " + material);
             }
         } catch (Exception ex) {
             if (!warned) {
@@ -218,17 +131,17 @@ public class EatFixModule implements Module, Listener {
         }
     }
 
-    /** Есть ли в руках (основной или второй) еда или выпиваемое зелье. */
-    private boolean holdsConsumable(Player player) {
-        return isConsumable(player.getInventory().getItemInMainHand().getType())
-                || isConsumable(player.getInventory().getItemInOffHand().getType());
-    }
-
     /** Еда + выпиваемые зелья. Молоко не трогаем — осознанное решение. */
     private boolean isConsumable(Material material) {
         if (material == Material.MILK_BUCKET) {
             return false;
         }
         return material.isEdible() || material == Material.POTION;
+    }
+
+    private void debug(Player player, String message) {
+        if (debug) {
+            plugin.getLogger().info("[EatFix][DEBUG] " + player.getName() + ": " + message);
+        }
     }
 }
