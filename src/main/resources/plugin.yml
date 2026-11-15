@@ -13,3 +13,5 @@ permissions:
   control.use:
     description: Доступ к команде /control
     default: op
+  control.easybans:
+    default: op
