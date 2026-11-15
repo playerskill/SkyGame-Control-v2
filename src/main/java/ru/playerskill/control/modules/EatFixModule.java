@@ -131,11 +131,8 @@ public class EatFixModule implements Module, Listener {
         }
     }
 
-    /** Еда + выпиваемые зелья. Молоко не трогаем — осознанное решение. */
+    /** Еда + выпиваемые зелья. */
     private boolean isConsumable(Material material) {
-        if (material == Material.MILK_BUCKET) {
-            return false;
-        }
         return material.isEdible() || material == Material.POTION;
     }
 
