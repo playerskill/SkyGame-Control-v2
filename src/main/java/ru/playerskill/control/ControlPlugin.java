@@ -59,9 +59,6 @@ public class ControlPlugin extends JavaPlugin {
     public void reloadModules() {
         disableModules();
         commandHandler.unregisterAll();
-        if (watchdog != null) {
-            watchdog.shutdown();
-        }
         reloadConfig();
 
         // Параметры подключения могли измениться — пересоздаём пул.
