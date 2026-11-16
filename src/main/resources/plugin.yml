@@ -15,3 +15,6 @@ permissions:
     default: op
   control.easybans:
     default: op
+  control.watchdog:
+    description: Подкоманды сторожа базы данных (статус, test, test-outage)
+    default: op
