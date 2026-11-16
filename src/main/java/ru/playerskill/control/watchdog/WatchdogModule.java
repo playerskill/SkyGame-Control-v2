@@ -517,7 +517,7 @@ public final class WatchdogModule implements Listener {
         updatingVaultEconomy = true;
         try {
             if (vaultEconomyProxy != null) {
-                Bukkit.getServicesManager().unregister(economyClass, vaultEconomyProxy);
+                unregisterProxyFromServicesManager();
             }
             vaultEconomyProvider = selectedProvider;
             vaultEconomyProxy = Proxy.newProxyInstance(economyClass.getClassLoader(),
@@ -527,12 +527,29 @@ public final class WatchdogModule implements Listener {
                             return invokeVaultEconomy(method, arguments);
                         }
                     });
-            Bukkit.getServicesManager().register(economyClass, vaultEconomyProxy, plugin, ServicePriority.Highest);
+            registerProxyInServicesManager();
             plugin.getLogger().info("[Watchdog] Защита экономики активна для провайдера "
                     + selectedProvider.getClass().getName() + ".");
         } finally {
             updatingVaultEconomy = false;
         }
+    }
+
+    /** Регистрация прокси в ServicesManager через raw-типы: компилятор не может
+     *  вывести дженерики для Class<?> + Object, хотя в рантайме тип корректен. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void registerProxyInServicesManager() {
+        Class rawClass = vaultEconomyClass;
+        Object proxy = vaultEconomyProxy;
+        Bukkit.getServicesManager().register(rawClass, proxy, plugin, ServicePriority.Highest);
+    }
+
+    /** Снятие прокси с регистрации — аналог registerProxyInServicesManager. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void unregisterProxyFromServicesManager() {
+        Class rawClass = vaultEconomyClass;
+        Object proxy = vaultEconomyProxy;
+        Bukkit.getServicesManager().unregister(rawClass, proxy);
     }
 
     private Object invokeVaultEconomy(Method method, Object[] arguments) throws Throwable {
@@ -622,7 +639,7 @@ public final class WatchdogModule implements Listener {
         }
         updatingVaultEconomy = true;
         try {
-            Bukkit.getServicesManager().unregister(vaultEconomyClass, proxy);
+            unregisterProxyFromServicesManager();
             vaultEconomyProxy = null;
         } finally {
             updatingVaultEconomy = false;
