@@ -113,3 +113,4 @@ public class CommandHandler implements CommandExecutor, TabCompleter {
     private String color(String input) {
         return ChatColor.translateAlternateColorCodes('&', input);
     }
+}
