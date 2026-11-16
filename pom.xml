@@ -15,6 +15,8 @@
         <spigot.api.version>1.12.2-R0.1-SNAPSHOT</spigot.api.version>
         <protocol.lib.version>4.4.0</protocol.lib.version>
         <mysql.driver.version>8.0.33</mysql.driver.version>
+        <hikaricp.version>4.0.3</hikaricp.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
     <repositories>
@@ -44,6 +46,12 @@
             <version>${protocol.lib.version}</version>
             <scope>provided</scope>
         </dependency>
+        <!-- Пул соединений: вшиваем внутрь jar через shade -->
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>${hikaricp.version}</version>
+        </dependency>
         <!-- Драйвер MySQL: вшиваем внутрь нашего jar через shade,
              чтобы не зависеть от версии драйвера на сервере -->
         <dependency>
@@ -61,7 +69,7 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.8.1</version>
             </plugin>
-            <!-- Сборка «толстого» jar: вшивает драйвер MySQL внутрь -->
+            <!-- Сборка «толстого» jar: вшивает драйвер MySQL и HikariCP внутрь -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -73,7 +81,7 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
-                            <!-- Лишний для драйвера мусор не тянем -->
+                            <!-- Лишний для библиотек мусор не тянем -->
                             <filters>
                                 <filter>
                                     <artifact>*:*</artifact>
@@ -85,6 +93,12 @@
                                 </filter>
                             </filters>
                             <relocations>
+                                <!-- Прячем пул под собственным пакетом,
+                                     чтобы не конфликтовать с другими плагинами -->
+                                <relocation>
+                                    <pattern>com.zaxxer.hikari</pattern>
+                                    <shadedPattern>ru.playerskill.shaded.hikari</shadedPattern>
+                                </relocation>
                                 <!-- Прячем драйвер под собственным пакетом,
                                      чтобы не конфликтовать с драйвером других плагинов -->
                                 <relocation>
