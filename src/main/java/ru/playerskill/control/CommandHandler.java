@@ -21,9 +21,16 @@ public class CommandHandler implements CommandExecutor, TabCompleter {
         this.plugin = plugin;
     }
 
-    /** Регистрация подкоманд модулями. Вызывается из ControlPlugin.register(). */
+    /**
+     * Регистрация подкоманды модуля. Вызывается из ControlPlugin.register().
+     * Модуль watchdog регистрирует здесь WatchdogSubcommand ("/control watchdog").
+     */
     public void register(Subcommand sub) {
-        subcommands.put(sub.getName().toLowerCase(), sub);
+        String name = sub.getName().toLowerCase();
+        if (subcommands.containsKey(name)) {
+            plugin.getLogger().warning("Подкоманда '" + name + "' уже зарегистрирована — перезаписываю.");
+        }
+        subcommands.put(name, sub);
     }
 
     /** Полная очистка реестра — при перезагрузке модулей. */
@@ -73,9 +80,12 @@ public class CommandHandler implements CommandExecutor, TabCompleter {
         }
 
         if (args.length == 1) {
-            result.add("reload");
+            String typed = args[0].toLowerCase();
+            if ("reload".startsWith(typed)) {
+                result.add("reload");
+            }
             for (String name : subcommands.keySet()) {
-                if (name.startsWith(args[0].toLowerCase())) {
+                if (name.startsWith(typed)) {
                     result.add(name);
                 }
             }
@@ -103,4 +113,3 @@ public class CommandHandler implements CommandExecutor, TabCompleter {
     private String color(String input) {
         return ChatColor.translateAlternateColorCodes('&', input);
     }
-}
