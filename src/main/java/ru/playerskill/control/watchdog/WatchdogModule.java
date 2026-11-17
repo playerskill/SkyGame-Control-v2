@@ -8,18 +8,10 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerLoginEvent;
-import org.bukkit.event.server.ServiceRegisterEvent;
-import org.bukkit.event.server.ServiceUnregisterEvent;
-import org.bukkit.plugin.RegisteredServiceProvider;
-import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.io.IOException;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,9 +33,9 @@ import javax.sql.DataSource;
 
 /**
  * Модуль SkyWatchdog: следит за доступностью общей базы данных.
- * При сбое блокирует экономику (Vault), через kick-after-seconds кикает
- * всех игроков и запрещает новые подключения. Вайтлист сервера не изменяется.
- * Предупреждение о кике отправляется за 10 секунд до кика, мелкие сбои проходят молча.
+ * При затяжном сбое предупреждает игроков за 10 секунд, кикает всех
+ * и запрещает новые подключения. Вайтлист сервера не изменяется.
+ * Экономика не блокируется: защита строится на частых проверках и быстром кике.
  */
 public final class WatchdogModule implements Listener {
 
@@ -75,7 +67,6 @@ public final class WatchdogModule implements Listener {
     private volatile long outageCheckSeconds;
     private volatile long kickAfterSeconds;
     private volatile long recoveryConfirmSeconds;
-    private volatile String economyBlockedMessage;
 
     /** Ники из bypass-players в нижнем регистре: им вход разрешён при сбое. */
     private volatile Set<String> bypassPlayers = new HashSet<String>();
@@ -83,11 +74,6 @@ public final class WatchdogModule implements Listener {
     private BukkitTask scheduledTask;
     private BukkitTask kickWarningTask;
     private volatile boolean kickWarningSent; // предупреждение о кике уже показано в текущем сбое
-
-    private Class<?> vaultEconomyClass;
-    private volatile Object vaultEconomyProvider;
-    private volatile Object vaultEconomyProxy;
-    private volatile boolean updatingVaultEconomy;
 
     public WatchdogModule(JavaPlugin plugin, DataSource sharedDataSource) {
         this.plugin = plugin;
@@ -104,8 +90,7 @@ public final class WatchdogModule implements Listener {
 
     public void start() {
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
-        applyConfig();        // сначала читаем конфиг — enabled становится актуальным
-        hookVaultEconomy();   // теперь guard внутри видит актуальное значение
+        applyConfig();
         if (enabled) {
             scheduleCheck(normalCheckSeconds);
             plugin.getLogger().info("[Watchdog] Мониторинг запущен; первая проверка через "
@@ -120,7 +105,7 @@ public final class WatchdogModule implements Listener {
         applyConfig();
 
         if (!enabled) {
-            // Выключили в конфиге: останавливаем проверки и защиту, снимаем блокировку входа.
+            // Выключили в конфиге: останавливаем проверки, снимаем блокировку входа.
             cancelScheduled();
             cancelKickWarning();
             if (state != State.NORMAL) {
@@ -129,24 +114,18 @@ public final class WatchdogModule implements Listener {
                 kicked = false;
                 kickWarningSent = false;
             }
-            unregisterVaultEconomyProxy();
             if (wasEnabled) {
                 plugin.getLogger().info("[Watchdog] Выключен после перезагрузки конфига.");
             }
             return;
         }
 
-        // Включены: если были выключены — заново подключаем защиту экономики.
-        if (!wasEnabled) {
-            hookVaultEconomy();
-        }
         scheduleCheck(state == State.NORMAL ? normalCheckSeconds : outageCheckSeconds);
     }
 
     public void shutdown() {
         cancelScheduled();
         cancelKickWarning();
-        unregisterVaultEconomyProxy();
     }
 
     private void applyConfig() {
@@ -155,9 +134,6 @@ public final class WatchdogModule implements Listener {
         outageCheckSeconds = Math.max(1L, plugin.getConfig().getLong("watchdog.checks.outage-check-interval-seconds", 10L));
         kickAfterSeconds = Math.max(1L, plugin.getConfig().getLong("watchdog.checks.kick-after-seconds", 300L));
         recoveryConfirmSeconds = Math.max(0L, plugin.getConfig().getLong("watchdog.checks.recovery-confirm-seconds", 120L));
-
-        economyBlockedMessage = plugin.getConfig().getString("messages.watchdog-economy-blocked",
-                "&cОперации с валютой временно недоступны: сбой базы данных.");
 
         Set<String> bypass = new HashSet<String>();
         for (String name : plugin.getConfig().getStringList("watchdog.bypass-players")) {
@@ -216,8 +192,6 @@ public final class WatchdogModule implements Listener {
         }
         sender.sendMessage(ChatColor.YELLOW + "Пул соединений: " + ChatColor.WHITE
                 + (dataSource != null ? "общий (от Control)" : "не передан — проверки будут проваливаться"));
-        sender.sendMessage(ChatColor.YELLOW + "Защита экономики: " + ChatColor.WHITE
-                + (vaultEconomyProxy != null ? "активна" : "выключена"));
         sender.sendMessage(ChatColor.YELLOW + "Интервалы (сек): фоновая проверка " + ChatColor.WHITE + normalCheckSeconds
                 + ChatColor.YELLOW + ", при сбое " + ChatColor.WHITE + outageCheckSeconds
                 + ChatColor.YELLOW + ", до кика " + ChatColor.WHITE + kickAfterSeconds
@@ -499,201 +473,6 @@ public final class WatchdogModule implements Listener {
             event.disallow(PlayerLoginEvent.Result.KICK_OTHER,
                     colorize(plugin.getConfig().getString("messages.watchdog-join-blocked",
                             "&cСервер временно закрыт: сбой базы данных. Попробуйте позже.")));
-        }
-    }
-
-    // ---------- Защита Vault Economy ----------
-
-    private void hookVaultEconomy() {
-        org.bukkit.plugin.Plugin vault = Bukkit.getPluginManager().getPlugin("Vault");
-        if (vault == null) {
-            plugin.getLogger().info("[Watchdog] Vault не установлен; защита экономики недоступна.");
-            return;
-        }
-        try {
-            vaultEconomyClass = Class.forName("net.milkbowl.vault.economy.Economy",
-                    true, vault.getClass().getClassLoader());
-            refreshVaultEconomyProvider();
-        } catch (ClassNotFoundException exception) {
-            plugin.getLogger().log(Level.WARNING,
-                    "[Watchdog] Не удалось загрузить API экономики Vault; защита недоступна.", exception);
-        }
-    }
-
-    @EventHandler
-    public void onEconomyServiceRegistered(ServiceRegisterEvent event) {
-        refreshVaultEconomyForEvent(event.getProvider().getService(), event.getProvider().getProvider());
-    }
-
-    @EventHandler
-    public void onEconomyServiceUnregistered(ServiceUnregisterEvent event) {
-        refreshVaultEconomyForEvent(event.getProvider().getService(), event.getProvider().getProvider());
-    }
-
-    private void refreshVaultEconomyForEvent(Class<?> service, Object changedProvider) {
-        if (vaultEconomyClass != null && service == vaultEconomyClass
-                && changedProvider != vaultEconomyProxy && !updatingVaultEconomy) {
-            refreshVaultEconomyProvider();
-        }
-    }
-
-    private void refreshVaultEconomyProvider() {
-        Class<?> economyClass = vaultEconomyClass;
-        if (economyClass == null || updatingVaultEconomy || !enabled) {
-            return;
-        }
-
-        Object selectedProvider = null;
-        int selectedPriority = -1;
-        for (Object registrationObject : Bukkit.getServicesManager().getRegistrations(economyClass)) {
-            RegisteredServiceProvider<?> registration = (RegisteredServiceProvider<?>) registrationObject;
-            Object provider = registration.getProvider();
-            if (provider == vaultEconomyProxy) {
-                continue;
-            }
-            if (registration.getPriority().ordinal() > selectedPriority) {
-                selectedProvider = provider;
-                selectedPriority = registration.getPriority().ordinal();
-            }
-        }
-
-        if (selectedProvider == null) {
-            unregisterVaultEconomyProxy();
-            return;
-        }
-        if (selectedProvider == vaultEconomyProvider && vaultEconomyProxy != null) {
-            return;
-        }
-
-        updatingVaultEconomy = true;
-        try {
-            if (vaultEconomyProxy != null) {
-                unregisterProxyFromServicesManager();
-            }
-            vaultEconomyProvider = selectedProvider;
-            vaultEconomyProxy = Proxy.newProxyInstance(economyClass.getClassLoader(),
-                    new Class<?>[]{economyClass}, new InvocationHandler() {
-                        @Override
-                        public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
-                            return invokeVaultEconomy(method, arguments);
-                        }
-                    });
-            registerProxyInServicesManager();
-            plugin.getLogger().info("[Watchdog] Защита экономики активна для провайдера "
-                    + selectedProvider.getClass().getName() + ".");
-        } finally {
-            updatingVaultEconomy = false;
-        }
-    }
-
-    /** Регистрация прокси в ServicesManager через raw-типы: компилятор не может
-     *  вывести дженерики для Class<?> + Object, хотя в рантайме тип корректен. */
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private void registerProxyInServicesManager() {
-        Class rawClass = vaultEconomyClass;
-        Object proxy = vaultEconomyProxy;
-        Bukkit.getServicesManager().register(rawClass, proxy, plugin, ServicePriority.Highest);
-    }
-
-    /** Снятие прокси с регистрации — аналог registerProxyInServicesManager. */
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private void unregisterProxyFromServicesManager() {
-        Class rawClass = vaultEconomyClass;
-        Object proxy = vaultEconomyProxy;
-        Bukkit.getServicesManager().unregister(rawClass, proxy);
-    }
-
-    private Object invokeVaultEconomy(Method method, Object[] arguments) throws Throwable {
-        if (method.getDeclaringClass() == Object.class) {
-            if ("toString".equals(method.getName())) {
-                return "SkyWatchdog Vault economy guard";
-            }
-            if ("hashCode".equals(method.getName())) {
-                return System.identityHashCode(vaultEconomyProxy);
-            }
-            if ("equals".equals(method.getName())) {
-                return vaultEconomyProxy == (arguments == null ? null : arguments[0]);
-            }
-        }
-
-        if (state != State.NORMAL && isEconomyMutation(method.getName())) {
-            return blockedEconomyResult(method, arguments);
-        }
-        if (vaultEconomyProvider == null) {
-            return defaultEconomyResult(method.getReturnType());
-        }
-        try {
-            return method.invoke(vaultEconomyProvider, arguments);
-        } catch (java.lang.reflect.InvocationTargetException exception) {
-            throw exception.getCause();
-        }
-    }
-
-    private boolean isEconomyMutation(String methodName) {
-        return "withdrawPlayer".equals(methodName) || "depositPlayer".equals(methodName)
-                || "createPlayerAccount".equals(methodName) || "bankWithdraw".equals(methodName)
-                || "bankDeposit".equals(methodName) || "createBank".equals(methodName)
-                || "deleteBank".equals(methodName);
-    }
-
-    private Object blockedEconomyResult(Method method, Object[] arguments) throws Exception {
-        if (method.getReturnType() == boolean.class || method.getReturnType() == Boolean.class) {
-            return false;
-        }
-        if (!"net.milkbowl.vault.economy.EconomyResponse".equals(method.getReturnType().getName())) {
-            return defaultEconomyResult(method.getReturnType());
-        }
-
-        ClassLoader loader = vaultEconomyClass.getClassLoader();
-        Class<?> responseClass = Class.forName("net.milkbowl.vault.economy.EconomyResponse", true, loader);
-        Class<?> responseTypeClass = Class.forName(
-                "net.milkbowl.vault.economy.EconomyResponse$ResponseType", true, loader);
-        Object failureType = null;
-        for (Object constant : responseTypeClass.getEnumConstants()) {
-            if ("FAILURE".equals(constant.toString())) {
-                failureType = constant;
-                break;
-            }
-        }
-        double amount = 0.0D;
-        if (arguments != null) {
-            for (Object argument : arguments) {
-                if (argument instanceof Number) {
-                    amount = ((Number) argument).doubleValue();
-                }
-            }
-        }
-        Constructor<?> constructor = responseClass.getConstructor(double.class, double.class,
-                responseTypeClass, String.class);
-        return constructor.newInstance(amount, 0.0D, failureType, economyBlockedMessage);
-    }
-
-    private Object defaultEconomyResult(Class<?> returnType) {
-        if (!returnType.isPrimitive() || returnType == void.class) {
-            return null;
-        }
-        if (returnType == boolean.class) return false;
-        if (returnType == char.class) return '\0';
-        if (returnType == byte.class) return (byte) 0;
-        if (returnType == short.class) return (short) 0;
-        if (returnType == int.class) return 0;
-        if (returnType == long.class) return 0L;
-        if (returnType == float.class) return 0.0F;
-        if (returnType == double.class) return 0.0D;
-        return null;
-    }
-
-    private void unregisterVaultEconomyProxy() {
-        Object proxy = vaultEconomyProxy;
-        if (vaultEconomyClass == null || proxy == null) {
-            return;
-        }
-        updatingVaultEconomy = true;
-        try {
-            unregisterProxyFromServicesManager();
-            vaultEconomyProxy = null;
-        } finally {
-            updatingVaultEconomy = false;
         }
     }
 }
