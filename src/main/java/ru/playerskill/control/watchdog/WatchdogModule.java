@@ -43,11 +43,15 @@ import javax.sql.DataSource;
  * Модуль SkyWatchdog: следит за доступностью общей базы данных.
  * При сбое блокирует экономику (Vault), через kick-after-seconds кикает
  * всех игроков и запрещает новые подключения. Вайтлист сервера не изменяется.
+ * Предупреждение о кике отправляется за 10 секунд до кика, мелкие сбои проходят молча.
  */
 public final class WatchdogModule implements Listener {
 
     /** Право подкоманды /control watchdog. */
     public static final String PERMISSION_SUBCOMMAND = "control.watchdog";
+
+    /** За сколько секунд до кика отправлять предупреждение в чат. */
+    private static final long KICK_WARNING_SECONDS = 10L;
 
     private enum State {
         NORMAL,   // база доступна, фоновые проверки
@@ -77,6 +81,8 @@ public final class WatchdogModule implements Listener {
     private volatile Set<String> bypassPlayers = new HashSet<String>();
 
     private BukkitTask scheduledTask;
+    private BukkitTask kickWarningTask;
+    private volatile boolean kickWarningSent; // предупреждение о кике уже показано в текущем сбое
 
     private Class<?> vaultEconomyClass;
     private volatile Object vaultEconomyProvider;
@@ -98,8 +104,8 @@ public final class WatchdogModule implements Listener {
 
     public void start() {
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
-        hookVaultEconomy();
-        applyConfig();
+        applyConfig();        // сначала читаем конфиг — enabled становится актуальным
+        hookVaultEconomy();   // теперь guard внутри видит актуальное значение
         if (enabled) {
             scheduleCheck(normalCheckSeconds);
             plugin.getLogger().info("[Watchdog] Мониторинг запущен; первая проверка через "
@@ -116,10 +122,12 @@ public final class WatchdogModule implements Listener {
         if (!enabled) {
             // Выключили в конфиге: останавливаем проверки и защиту, снимаем блокировку входа.
             cancelScheduled();
+            cancelKickWarning();
             if (state != State.NORMAL) {
                 state = State.NORMAL;
                 recoveryStartedAt = 0L;
                 kicked = false;
+                kickWarningSent = false;
             }
             unregisterVaultEconomyProxy();
             if (wasEnabled) {
@@ -137,6 +145,7 @@ public final class WatchdogModule implements Listener {
 
     public void shutdown() {
         cancelScheduled();
+        cancelKickWarning();
         unregisterVaultEconomyProxy();
     }
 
@@ -361,13 +370,14 @@ public final class WatchdogModule implements Listener {
         outageStartedAt = System.currentTimeMillis();
         recoveryStartedAt = 0L;
         kicked = false;
-        broadcast("watchdog-outage",
-                "&c[Сервер] Обнаружен сбой базы данных. Операции с валютой приостановлены.");
+        kickWarningSent = false;
+        scheduleKickWarning();
         logOutagePlayers();
     }
 
     private void enterLockedState() {
         state = State.LOCKED;
+        cancelKickWarning();
 
         String reason = colorize(plugin.getConfig().getString("messages.watchdog-kick",
                 "&cОшибка базы данных, срочно сообщите об этом в группе тг - t.me/skygame001"));
@@ -387,9 +397,50 @@ public final class WatchdogModule implements Listener {
         outageStartedAt = 0L;
         recoveryStartedAt = 0L;
         kicked = false;
-        broadcast("watchdog-recovered",
-                "&a[Сервер] База данных восстановлена. Вход открыт.");
+        cancelKickWarning();
+        // Сообщение о восстановлении показываем только тем, кто видел предупреждение о кике:
+        // иначе после тихого сбоя оно всплывёт из ниоткуда.
+        if (kickWarningSent) {
+            broadcast("watchdog-recovered",
+                    "&a[Сервер] База данных восстановлена. Вход открыт.");
+        }
+        kickWarningSent = false;
         plugin.getLogger().info("[Watchdog] База данных восстановлена; блокировка входа снята.");
+    }
+
+    // ---------- Предупреждение перед киком ----------
+
+    /** Планирует объявление за KICK_WARNING_SECONDS до кика. */
+    private void scheduleKickWarning() {
+        cancelKickWarning();
+        long delaySeconds = kickAfterSeconds - KICK_WARNING_SECONDS;
+        if (delaySeconds <= 0L) {
+            // Кик через 10 сек. или раньше — предупреждение сразу.
+            broadcastKickWarning();
+            return;
+        }
+        // runTaskLater — главный поток: broadcastMessage обязан идти в нём.
+        kickWarningTask = Bukkit.getScheduler().runTaskLater(plugin,
+                this::broadcastKickWarning, delaySeconds * 20L);
+    }
+
+    private void broadcastKickWarning() {
+        kickWarningTask = null;
+        if (!enabled || !plugin.isEnabled() || state != State.OUTAGE || kickWarningSent) {
+            return;
+        }
+        kickWarningSent = true;
+        broadcast("watchdog-kick-warning",
+                "&c[Сервер] База данных не работает. Через 10 секунд все игроки будут отключены от сервера.");
+        plugin.getLogger().info("[Watchdog] Отправлено предупреждение о кике за "
+                + KICK_WARNING_SECONDS + " сек.");
+    }
+
+    private void cancelKickWarning() {
+        if (kickWarningTask != null) {
+            kickWarningTask.cancel();
+            kickWarningTask = null;
+        }
     }
 
     private boolean isBypassed(Player player) {
